@@ -1,1 +1,278 @@
 
+name: Build Veric
+on: [workflow_dispatch, push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Create project
+        run: |
+          mkdir -p VericApp/app
+          cat > VericApp/app/build.gradle.kts <<'VERIC_EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.veric.assistant"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.veric.assistant"; minSdk = 29; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies { implementation("androidx.core:core-ktx:1.13.1") }
+          VERIC_EOF
+          mkdir -p VericApp/app/src/main
+          cat > VericApp/app/src/main/AndroidManifest.xml <<'VERIC_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+              <queries><intent><action android:name="android.speech.RecognitionService"/></intent></queries>
+              <application android:label="Veric" android:allowBackup="false" android:theme="@android:style/Theme.DeviceDefault.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".VericService" android:exported="false" android:foregroundServiceType="microphone"/>
+              </application>
+          </manifest>
+          VERIC_EOF
+          mkdir -p VericApp/app/src/main/java/com/veric/assistant
+          cat > VericApp/app/src/main/java/com/veric/assistant/MainActivity.kt <<'VERIC_EOF'
+          package com.veric.assistant
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.View
+          import android.widget.*
+
+          class MainActivity : Activity() {
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  val prefs = getSharedPreferences("veric", MODE_PRIVATE)
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(48, 96, 48, 48) }
+                  fun label(t: String) = TextView(this).apply { text = t; textSize = 16f; setPadding(0, 24, 0, 8) }
+                  val key = EditText(this).apply {
+                      hint = "Anthropic API key (sk-ant-...)"; setText(prefs.getString("key", ""))
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  }
+                  val title = EditText(this).apply { hint = "Call me (Sir / Boss / Bro)"; setText(prefs.getString("title", "Sir")) }
+                  val start = Button(this).apply { text = "Start Veric" }
+                  val stop = Button(this).apply { text = "Stop Veric" }
+                  val batt = Button(this).apply { text = "Allow background running (important on vivo)" }
+                  col.addView(TextView(this).apply { text = "Veric"; textSize = 30f })
+                  col.addView(label("API key")); col.addView(key)
+                  col.addView(label("What should Veric call you?")); col.addView(title)
+                  col.addView(start); col.addView(stop); col.addView(batt)
+                  col.addView(label("Then say: \"Veric, what's the news today?\""))
+                  setContentView(ScrollView(this).apply { addView(col) })
+
+                  start.setOnClickListener {
+                      prefs.edit().putString("key", key.text.toString().trim())
+                          .putString("title", title.text.toString().trim().ifEmpty { "Sir" }).apply()
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  stop.setOnClickListener { stopService(Intent(this, VericService::class.java)) }
+                  batt.setOnClickListener {
+                      startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+                  }
+              }
+
+              override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
+                  super.onRequestPermissionsResult(c, p, r)
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == 0) {
+                      startForegroundService(Intent(this, VericService::class.java))
+                      Toast.makeText(this, "Veric is listening. Say \"Veric\"", Toast.LENGTH_LONG).show()
+                  } else Toast.makeText(this, "Microphone permission is needed", Toast.LENGTH_LONG).show()
+              }
+          }
+          VERIC_EOF
+          mkdir -p VericApp/app/src/main/java/com/veric/assistant
+          cat > VericApp/app/src/main/java/com/veric/assistant/VericService.kt <<'VERIC_EOF'
+          package com.veric.assistant
+
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.media.AudioManager
+          import android.media.ToneGenerator
+          import android.os.*
+          import android.speech.*
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import androidx.core.app.NotificationCompat
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.*
+
+          class VericService : Service(), TextToSpeech.OnInitListener {
+              private lateinit var tts: TextToSpeech
+              private var ttsReady = false
+              private var rec: SpeechRecognizer? = null
+              private val h = Handler(Looper.getMainLooper())
+              private var awaiting = false
+              private var busy = false
+              private var running = true
+              private val history = ArrayList<Pair<String, String>>()
+              private val wake = Regex("\\b(veric|verick|merrick|derek|eric)\\b[\\s,.:!]*(.*)$", RegexOption.IGNORE_CASE)
+              private fun prefs() = getSharedPreferences("veric", MODE_PRIVATE)
+              private fun title() = prefs().getString("title", "Sir") ?: "Sir"
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("veric", "Veric", NotificationManager.IMPORTANCE_LOW))
+                  val n = NotificationCompat.Builder(this, "veric").setContentTitle("Veric is listening")
+                      .setContentText("Say \"Veric\"").setSmallIcon(android.R.drawable.ic_btn_speak_now).setOngoing(true).build()
+                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  tts = TextToSpeech(this, this)
+              }
+
+              override fun onInit(status: Int) {
+                  ttsReady = status == TextToSpeech.SUCCESS
+                  if (ttsReady) tts.language = Locale.getDefault()
+                  say("Veric online. Yes ${title()}?") { awaiting = true; listen() }
+              }
+
+              override fun onStartCommand(i: Intent?, f: Int, id: Int) = START_STICKY
+
+              override fun onDestroy() {
+                  running = false
+                  h.removeCallbacksAndMessages(null)
+                  rec?.destroy(); tts.shutdown()
+                  super.onDestroy()
+              }
+
+              private fun beep() { try { ToneGenerator(AudioManager.STREAM_MUSIC, 80).startTone(ToneGenerator.TONE_PROP_BEEP, 120) } catch (e: Exception) {} }
+
+              private fun say(text: String, then: () -> Unit = { listen() }) {
+                  h.post {
+                      rec?.cancel()
+                      if (!ttsReady) { then(); return@post }
+                      tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                          override fun onStart(id: String?) {}
+                          override fun onDone(id: String?) { h.post { then() } }
+                          @Deprecated("Deprecated in Java") override fun onError(id: String?) { h.post { then() } }
+                      })
+                      tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "v")
+                  }
+              }
+
+              private fun again(delay: Long = 400) { h.postDelayed({ listen() }, delay) }
+
+              private fun listen() {
+                  if (!running || busy) return
+                  h.post {
+                      rec?.destroy()
+                      rec = SpeechRecognizer.createSpeechRecognizer(this).apply {
+                          setRecognitionListener(object : RecognitionListener {
+                              override fun onResults(b: Bundle?) {
+                                  val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                                  if (t.isNullOrBlank()) again() else handle(t)
+                              }
+                              override fun onError(e: Int) { again(if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1500 else 400) }
+                              override fun onReadyForSpeech(p: Bundle?) {}
+                              override fun onBeginningOfSpeech() {}
+                              override fun onRmsChanged(v: Float) {}
+                              override fun onBufferReceived(b: ByteArray?) {}
+                              override fun onEndOfSpeech() {}
+                              override fun onPartialResults(b: Bundle?) {}
+                              override fun onEvent(t: Int, b: Bundle?) {}
+                          })
+                      }
+                      val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                      rec?.startListening(i)
+                  }
+              }
+
+              private fun handle(t: String) {
+                  if (awaiting) { awaiting = false; ask(t); return }
+                  val m = wake.find(t)
+                  if (m == null) { again(); return }
+                  val rest = m.groupValues[2].trim()
+                  beep()
+                  if (rest.length > 1) ask(rest) else { awaiting = true; say("Yes ${title()}?") }
+              }
+
+              private fun ask(q: String) {
+                  busy = true
+                  Thread {
+                      val ans = try { callClaude(q) } catch (e: Exception) { "Sorry ${title()}, I couldn't reach the internet." }
+                      say(ans) { busy = false; listen() }
+                  }.start()
+              }
+
+              private fun callClaude(q: String): String {
+                  val key = prefs().getString("key", "") ?: ""
+                  if (key.isEmpty()) return "Please add your API key in the app, ${title()}."
+                  history.add("user" to q)
+                  val msgs = JSONArray()
+                  history.takeLast(8).forEach { msgs.put(JSONObject().put("role", it.first).put("content", it.second)) }
+                  val body = JSONObject()
+                      .put("model", "claude-sonnet-5-5").put("max_tokens", 500)
+                      .put("system", "You are Veric, a witty concise voice assistant. Address the user as ${title()}. Reply in 1-3 short spoken sentences, plain text, no markdown. Use web search for anything current.")
+                      .put("tools", JSONArray().put(JSONObject().put("type", "web_search_20250305").put("name", "web_search").put("max_uses", 3)))
+                      .put("messages", msgs)
+                  val c = URL("https://api.anthropic.com/v1/messages").openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"; c.connectTimeout = 15000; c.readTimeout = 45000; c.doOutput = true
+                  c.setRequestProperty("x-api-key", key)
+                  c.setRequestProperty("anthropic-version", "2023-06-01")
+                  c.setRequestProperty("content-type", "application/json")
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  if (c.responseCode >= 400) { history.removeLast(); return "The service returned error ${c.responseCode}, ${title()}. Check your API key and credit." }
+                  val resp = JSONObject(c.inputStream.bufferedReader().readText())
+                  val parts = resp.getJSONArray("content")
+                  val sb = StringBuilder()
+                  for (i in 0 until parts.length()) { val p = parts.getJSONObject(i); if (p.optString("type") == "text") sb.append(p.getString("text")) }
+                  val out = sb.toString().trim().ifEmpty { "I found nothing, ${title()}." }
+                  history.add("assistant" to out)
+                  return out
+              }
+          }
+          VERIC_EOF
+          mkdir -p VericApp
+          cat > VericApp/build.gradle.kts <<'VERIC_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          VERIC_EOF
+          mkdir -p VericApp
+          cat > VericApp/gradle.properties <<'VERIC_EOF'
+          android.useAndroidX=true
+          VERIC_EOF
+          mkdir -p VericApp
+          cat > VericApp/settings.gradle.kts <<'VERIC_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "Veric"
+          include(":app")
+          VERIC_EOF
+      - name: Build
+        working-directory: VericApp
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Veric-APK
+          path: VericApp/app/build/outputs/apk/debug/app-debug.apk
